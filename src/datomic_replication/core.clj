@@ -14,22 +14,21 @@
   ([conn from-t]
      (transactions conn from-t 1000))
   ([conn from-t poll-interval]
-     (let [log (datomic/log conn)
-           ch  (async/chan)]
+     (let [ch        (async/chan)
+           continue? (atom true)
+           stopper   #(reset! continue? false)]
        (go-loop [from-t from-t]
-         (let [txs (datomic/tx-range log from-t nil)]
-           (println "tx-range returned:" txs)
-           (if (seq txs)
-             (do
-               (println "Got txs:" txs)
-               (doseq [tx txs]
-                 (println "Putting:" tx)
-                 (>! ch tx))
-               (recur (inc (:t (last txs)))))
-             (do
-               (<! (async/timeout poll-interval))
-               (recur from-t)))))
-       ch)))
+         (when @continue?
+           (let [txs (datomic/tx-range (datomic/log conn) from-t nil)]
+             (if (seq txs)
+               (do
+                 (doseq [tx txs]
+                   (>! ch tx))
+                 (recur (inc (:t (last txs)))))
+               (do
+                 (<! (async/timeout poll-interval))
+                 (recur from-t))))))
+       [ch stopper])))
 
 (defn- init-dest-database
   "This is the default implementation of the `:init` function that you
@@ -57,17 +56,26 @@
   "Sends the transaction to the connection."
   [{:keys [t data] :as tx} source-conn dest-conn e->id]
   (println "Got tx:" tx)
-  (try
-    (let [source-db (datomic/as-of (datomic/db source-conn) t)
-          datoms    (for [[e a v t added?] data]
-                      [(if added? :db/add :db/retract)
-                       (e->id source-db e)
-                       (:db/ident (datomic/entity source-db a))
-                       v])]
-      (datomic/transact dest-conn datoms))
-    (catch Exception e
-      (.printStackTrace e)
-      (throw e))))
+  (let [source-db (datomic/as-of (datomic/db source-conn) t)
+        datoms    (for [[e a v t added?] data]
+                    [(if added? :db/add :db/retract)
+                     (e->id source-db e)
+                     (:db/ident (datomic/entity source-db a))
+                     v])
+        datoms    (for [[e a v t added?] data
+                        :when added?
+                        :let [[id-attr id-value] (e->id source-db e)]]
+                    (hash-map
+                     :db/id (datomic/tempid :db.part/user)
+                     id-attr id-value
+                     (:db/ident (datomic/entity source-db a)) v))]
+    (prn "transacting:" datoms)
+    (try
+      @(datomic/transact dest-conn datoms)
+      (catch Exception e
+        (println "Error transacting!!!!")
+        (.printStackTrace e)
+        (throw e)))))
 
 
 (defprotocol Replicator
@@ -85,18 +93,19 @@
      (replicator source-conn dest-conn nil))
   ([source-conn dest-conn opts]
      (let [{:keys [init e->id poll-interval]} (merge default-opts opts)
-           control-chan (async/chan)
-           transactions (transactions source-conn poll-interval)
-           initialized? (atom false)]
+           control-chan  (async/chan)
+           [txs stopper] (transactions source-conn poll-interval)
+           initialized?  (atom false)]
        (reify Replicator
          (start [this]
            (go-loop []
-             (let [[tx ch] (async/alts! [transactions control-chan])]
-               (when (identical? ch transactions)
+             (let [[tx ch] (async/alts! [txs control-chan])]
+               (when (identical? ch txs)
                  (when-not @initialized?
                    (reset! initialized? true)
                    (init dest-conn))
                  (replicate-tx tx source-conn dest-conn e->id)
                  (recur)))))
          (stop [this]
+           (stopper)
            (async/put! control-chan :stop))))))
