@@ -19,12 +19,11 @@
 
         (try
           ;; Create an attribute in the source database
-          (let [result @(datomic/transact c1 [{:db/id                 (datomic/tempid :db.part/db)
-                                               :db/ident              :user/name
-                                               :db/valueType          :db.type/string
-                                               :db/cardinality        :db.cardinality/one
-                                               :db.install/_attribute :db.part/db}])]
-            (is result))
+          @(datomic/transact c1 [{:db/id                 (datomic/tempid :db.part/db)
+                                  :db/ident              :user/name
+                                  :db/valueType          :db.type/string
+                                  :db/cardinality        :db.cardinality/one
+                                  :db.install/_attribute :db.part/db}])
 
           ;; Wait a bit for it to replicate
           (Thread/sleep 500)
