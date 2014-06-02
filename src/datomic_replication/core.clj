@@ -29,7 +29,7 @@
                  :db/cardinality        :db.cardinality/one
                  :db.install/_attribute :db.part/db}]))
 
-(def ^:dynamic e->id-default
+(def ^:dynamic e->lookup-ref-default
   "Function that returns the :ident of an attribute to use as the
   database-independent identifier for the given entity."
   (fn [db ent]
@@ -37,22 +37,18 @@
       [:db/ident ident]
       [:datomic-replication/source-eid (:db/id ent)])))
 
-(defn default-opts []
-  {:init          init-dest-database
-   :e->id         e->id-default
-   :poll-interval 100})
-
 
 (defn transactions
   "Returns an async channel of transactions.
    Options include:
     - from-t - the `t` to start at
-    - poll interval - how long to pause when there are no new transactions
+    - poll-interval - how long to pause when there are no new transactions
   "
   ([conn]
-     (transactions conn nil))
+     (transactions conn {:from-t        nil
+                         :poll-interval 100}))
   ([conn opts]
-     (let [{:keys [from-t poll-interval]} (merge (default-opts) opts)
+     (let [{:keys [from-t poll-interval]} opts
            ch        (async/chan)
            continue? (atom true)
            stopper   #(reset! continue? false)]
@@ -62,7 +58,8 @@
              (if (seq txs)
                (do
                  (doseq [tx txs]
-                   (>! ch tx))
+                   (when @continue?
+                     (>! ch tx)))
                  (recur (inc (:t (last txs)))))
                (do
                  (<! (async/timeout poll-interval))
@@ -76,49 +73,77 @@
 (defn skip-attr? [attr]
   false)
 
+(defn- log [msg data]
+  (println msg)
+  (clojure.pprint/pprint data))
+
+;; (defn extract-additions
+;;   "Initially, transactions contain a sequence of datoms in the usual
+;;   form: [e a v t added?]
+;;   This transforms the datoms into a sequence of maps of the form:
+;;   {:db/id e a1 v1 a2 v2 ...}"
+;;   [datoms]
+;;   (->> datoms
+;;        ;; Step 1: transform to {e1 {a1 v1 ...} e2 {a3 v3 ...} ...}
+;;        (reduce (fn [m [e a v t added?]]
+;;                  (if added?
+;;                    (assoc-in m [e a] v)
+;;                    m))
+;;                nil)
+;;        ;; Then to: ({:db/id e1 a1 v1 ...}, {:db/id e2
+;;        (map (fn [[e m]]
+;;               (assoc m :db/id e)))))
 
 (defn replicate-tx
   "Sends the transaction to the connection."
-  [{:keys [t data] :as tx} source-conn dest-conn e->id]
-  (prn "Got tx:")
-  (clojure.pprint/pprint tx)
-  (let [source-db (d/as-of (d/db source-conn) t)
-        dest-db   (d/db dest-conn)
-        eids      (doall (distinct (for [[e] data] e)))
-        _         (prn "eids are " eids)
+  [{:keys [t data] :as tx} source-conn dest-conn e->lookup-ref]
+  (log "Got tx:" tx)
+  (let [source-db    (d/as-of (d/db source-conn) t)
+        dest-db      (d/db dest-conn)
+        eids         (distinct (for [[e] data] e))
 
-        ;; Create a mapping from the distinct eids in the transaction
-        ;; to a tempid in the correct partition.
-        e->temp   (into {}
-                        (for [eid eids]
-                          (let [part (partition-ident source-db eid)]
-                            [eid (d/tempid part)])))
+        ;; Mapping from each distinct eid to a database-independent
+        ;; identifier for the entity - a lookup-ref in the form:
+        ;; [attr-ident attr-value]. This will be one of:
+        ;;  - [:db/ident <val>], for entities that have an ident
+        ;;  - [:datomic-replication/source-eid <eid>] (default)
+        ;;  - a domain-specific unique attribute+value pair
+        ->lookup-ref (memoize
+                      (fn [eid]
+                        (e->lookup-ref source-db (d/entity source-db eid))))
 
-        datoms    (for [[e a v t added?] data
-                        :let [ent              (d/entity source-db e)
-                              [id-attr id-val] (e->id source-db ent)
-                              attr             (d/entity source-db a)
-                              attr-ident       (:db/ident attr)
-                              is-ref?          (= :db.type/ref (:db/valueType attr))
-                              v                (if is-ref?
-                                                 (or (e->temp v) v)
-                                                 v)]
-                        :when (not (skip-attr? attr))]
-                    (if added?
-                      (if (= [:db/ident :db.part/db] [id-attr id-val]) ; FIXME - too specific
-                        (hash-map
-                         :db/id     id-val
-                         attr-ident v)
-                        (hash-map
-                         :db/id     (e->temp e)
-                         id-attr    id-val
-                         attr-ident v))
-                      [:db/retract
-                       [id-attr id-val]
-                       attr-ident
-                       v]))]
-    (prn "transacting:")
-    (clojure.pprint/pprint datoms)
+        ;; Function to translate an eid from the source database into
+        ;; one that is valid in the destination database.  This will
+        ;; be either an actual eid, if the entity exists already, or a
+        ;; tempid if the entity is new.
+        ->dest-eid   (memoize
+                      (fn [eid]
+                        (let [lookup-ref (->lookup-ref eid)
+                              dest-ent   (d/entity dest-db lookup-ref)]
+                          (if dest-ent
+                            (:db/id dest-ent)
+                            (let [part (partition-ident source-db eid)]
+                              (d/tempid part))))))
+
+        datoms       (for [[e a v t added?] data
+                           :let [[id-attr id-val] (->lookup-ref e)
+                                 attr             (d/entity source-db a)
+                                 attr-ident       (:db/ident attr)
+                                 is-ref?          (= :db.type/ref (:db/valueType attr))
+                                 v                (if is-ref?
+                                                    (->dest-eid v)
+                                                    v)]
+                           :when (not (skip-attr? attr))]
+                       (if added?
+                         (hash-map
+                          :db/id     (->dest-eid e)
+                          id-attr    id-val
+                          attr-ident v)
+                         [:db/retract
+                          [id-attr id-val]
+                          attr-ident
+                          v]))]
+    (log "transacting:" datoms)
     (try
       @(d/transact dest-conn datoms)
       (catch Exception e
@@ -131,12 +156,39 @@
   (start [this])
   (stop  [this]))
 
+(defn default-opts []
+  {:init          init-dest-database
+   :e->lookup-ref e->lookup-ref-default
+   :poll-interval 100
+   :start-t       nil})
+
 (defn replicator
-  "Returns a replicator that copies transactions from source-conn to dest-conn."
+  "Returns a replicator that copies transactions from source-conn to dest-conn.
+  Call `start`, passing the returned object, to begin replication.
+  Call `stop` to stop replication.
+  `opts` is a map that can have the the following keys (all optional):
+   - :init - function to initialize the destination database. Will be passed 2
+            arguments: [dest-conn tx], where `tx` is the first transaction to be
+            replicated. The default is `init-dest-database`, which creates the
+            :datomic-replication/source-eid attribute with a :txInstant one second
+            earlier than `tx`.
+   - :e->lookup-ref - Function to return a lookup-ref, given a db and an eid. The
+                      default returns [:db/ident <ident>] if the entity has an ident,
+                      or [:datomic-replication/source-eid <eid>] otherwise.
+   - :poll-interval - Number of milliseconds to wait before calling `tx-range` again
+                     after calling it and getting no transactions. This determines
+                     how frequently to poll when we are \"caught up\".
+   - :from-t - The `t` to start from. Default is nil, which means to start at the 
+               beginning of the source database's history, or at the last-t stored
+               in the destination database.
+  "
   ([source-conn dest-conn]
      (replicator source-conn dest-conn nil))
   ([source-conn dest-conn opts]
-     (let [{:keys [init e->id poll-interval] :as opts} (merge (default-opts) opts)
+     (let [{:keys [init
+                   e->lookup-ref
+                   poll-interval
+                   from-t] :as opts} (merge (default-opts) opts)
            control-chan  (async/chan)
            [txs stopper] (transactions source-conn opts)
            initialized?  (atom false)]
@@ -149,7 +201,7 @@
                    (reset! initialized? true)
                    (init dest-conn (-> tx :data first (nth 3) (->> (d/entity (d/db source-conn))))))
                  (try
-                   (replicate-tx tx source-conn dest-conn e->id)
+                   (replicate-tx tx source-conn dest-conn e->lookup-ref) 
                    (catch Exception e
                      (.printStackTrace e)
                      (throw e)))
