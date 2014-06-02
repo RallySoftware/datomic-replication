@@ -1,6 +1,7 @@
 (ns datomic-replication.core
   "Datomic Replication"
   (:require [clojure.core.async :as async :refer [go go-loop <! >!]]
+            [clojure.tools.logging :as log]
             [datomic.api :as d]
             [enos.core :refer [dochan!]])
   (:import [java.util Date]))
@@ -32,10 +33,11 @@
 (def ^:dynamic e->lookup-ref-default
   "Function that returns the :ident of an attribute to use as the
   database-independent identifier for the given entity."
-  (fn [db ent]
-    (if-let [ident (:db/ident ent)]
-      [:db/ident ident]
-      [:datomic-replication/source-eid (:db/id ent)])))
+  (fn [db eid]
+    (let [ent (d/entity db eid)]
+      (if-let [ident (:db/ident ent)]
+        [:db/ident ident]
+        [:datomic-replication/source-eid (:db/id ent)]))))
 
 
 (defn transactions
@@ -94,7 +96,7 @@
         ;;  - a domain-specific unique attribute+value pair
         ->lookup-ref (memoize
                       (fn [eid]
-                        (e->lookup-ref source-db (d/entity source-db eid))))
+                        (e->lookup-ref source-db eid)))
 
         ;; Function to translate an eid from the source database into
         ;; one that is valid in the destination database.  This will
@@ -148,6 +150,8 @@
 
 (defn replicator
   "Returns a replicator that copies transactions from source-conn to dest-conn.
+  These can be actual connections or just the URIs as strings.
+
   Call `start`, passing the returned object, to begin replication.
   Call `stop` to stop replication.
   `opts` is a map that can have the the following keys (all optional):
@@ -168,11 +172,16 @@
   "
   ([source-conn dest-conn]
      (replicator source-conn dest-conn nil))
-  ([source-conn dest-conn opts]
-     (let [{:keys [init
-                   e->lookup-ref
-                   poll-interval
-                   from-t] :as opts} (merge (default-opts) opts)
+  ([source-conn dest-conn {:keys [init e->lookup-ref] :as opts}]
+     (let [opts          (merge (default-opts) opts)
+           source-conn   (if (string? source-conn)
+                           (d/connect source-conn)
+                           source-conn)
+           dest-conn     (if (string? dest-conn)
+                           (do
+                             (d/create-database dest-conn)
+                             (d/connect dest-conn))
+                           dest-conn)
            control-chan  (async/chan)
            [txs stopper] (transactions source-conn opts)
            initialized?  (atom false)]
@@ -184,7 +193,7 @@
                  (when-not @initialized?
                    (reset! initialized? true)
                    (init dest-conn (-> tx :data first (nth 3) (->> (d/entity (d/db source-conn))))))
-                   (replicate-tx tx source-conn dest-conn e->lookup-ref)
+                 (replicate-tx tx source-conn dest-conn e->lookup-ref)
                  (try
                    (catch Exception e
                      (.printStackTrace e)
