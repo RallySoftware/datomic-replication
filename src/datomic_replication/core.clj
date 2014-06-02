@@ -74,25 +74,9 @@
   false)
 
 (defn- log [msg data]
-  (println msg)
-  (clojure.pprint/pprint data))
-
-;; (defn extract-additions
-;;   "Initially, transactions contain a sequence of datoms in the usual
-;;   form: [e a v t added?]
-;;   This transforms the datoms into a sequence of maps of the form:
-;;   {:db/id e a1 v1 a2 v2 ...}"
-;;   [datoms]
-;;   (->> datoms
-;;        ;; Step 1: transform to {e1 {a1 v1 ...} e2 {a3 v3 ...} ...}
-;;        (reduce (fn [m [e a v t added?]]
-;;                  (if added?
-;;                    (assoc-in m [e a] v)
-;;                    m))
-;;                nil)
-;;        ;; Then to: ({:db/id e1 a1 v1 ...}, {:db/id e2
-;;        (map (fn [[e m]]
-;;               (assoc m :db/id e)))))
+  ;;(println msg)
+  ;;(clojure.pprint/pprint data)
+  )
 
 (defn replicate-tx
   "Sends the transaction to the connection."
@@ -200,8 +184,8 @@
                  (when-not @initialized?
                    (reset! initialized? true)
                    (init dest-conn (-> tx :data first (nth 3) (->> (d/entity (d/db source-conn))))))
+                   (replicate-tx tx source-conn dest-conn e->lookup-ref)
                  (try
-                   (replicate-tx tx source-conn dest-conn e->lookup-ref) 
                    (catch Exception e
                      (.printStackTrace e)
                      (throw e)))

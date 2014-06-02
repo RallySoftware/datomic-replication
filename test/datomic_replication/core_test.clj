@@ -61,7 +61,7 @@
       (define-attr c1 :user/name :string)
       (define-attr c1 :user/age :long)
 
-      @(datomic/transact c1 [{:db/id (d/tempid :db.part/user)
+      @(d/transact c1 [{:db/id (d/tempid :db.part/user)
                               :user/name "Chris"
                               :user/age  44}
                              {:db/id (d/tempid :db.part/user)
@@ -93,12 +93,12 @@
       (define-attr c1 :user/age :long)
 
       ;; Create a partition
-      @(datomic/transact c1 [{:db/id                 (d/tempid :db.part/db)
+      @(d/transact c1 [{:db/id                 (d/tempid :db.part/db)
                               :db/ident              :db.part/person
                               :db.install/_partition :db.part/db}])
 
       ;; Then put some people in the new partition
-      @(datomic/transact c1 [{:db/id     (d/tempid :db.part/person)
+      @(d/transact c1 [{:db/id     (d/tempid :db.part/person)
                               :user/name "Chris"
                               :user/age  44}
                              {:db/id     (d/tempid :db.part/person)
