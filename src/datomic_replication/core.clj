@@ -21,8 +21,7 @@
   [conn tx]
   @(d/transact conn
                [{:db/id                 (d/tempid :db.part/tx)
-                 ;; tx is the first transaction from the source database. We
-                 :db/txInstant          (Date. (- (.getTime (:db/txInstant tx)) 1000))}
+                 :db/txInstant          (Date. (- (.getTime (:db/txInstant tx)) 1000))} ; One second before tx
                 {:db/id                 (d/tempid :db.part/db)
                  :db/ident              :datomic-replication/source-eid
                  :db/valueType          :db.type/long
@@ -75,15 +74,10 @@
 (defn skip-attr? [attr]
   false)
 
-(defn- log [msg data]
-  ;;(println msg)
-  ;;(clojure.pprint/pprint data)
-  )
-
 (defn replicate-tx
   "Sends the transaction to the connection."
   [{:keys [t data] :as tx} source-conn dest-conn e->lookup-ref]
-  (log "Got tx:" tx)
+  (log/info "Got tx: " {:t (:t tx) :count (count (:data tx))})
   (let [source-db    (d/as-of (d/db source-conn) t)
         dest-db      (d/db dest-conn)
         eids         (distinct (for [[e] data] e))
@@ -129,12 +123,11 @@
                           [id-attr id-val]
                           attr-ident
                           v]))]
-    (log "transacting:" datoms)
+    ;;(log/info "transacting:" datoms)
     (try
       @(d/transact dest-conn datoms)
       (catch Exception e
-        (println "Error transacting!!!!")
-        (.printStackTrace e)
+        (log/error e "Exception thrown by replicate-tx")
         (throw e)))))
 
 
@@ -189,18 +182,17 @@
            initialized?  (atom false)]
        (reify Replicator
          (start [this]
+           (log/info "Starting replicator")
            (go-loop []
              (let [[tx ch] (async/alts! [txs control-chan])]
                (when (identical? ch txs)
                  (when-not @initialized?
+                   (log/info "Initializing destination database")
                    (reset! initialized? true)
                    (init dest-conn (-> tx :data first (nth 3) (->> (d/entity (d/db source-conn))))))
                  (replicate-tx tx source-conn dest-conn e->lookup-ref)
-                 (try
-                   (catch Exception e
-                     (.printStackTrace e)
-                     (throw e)))
                  (recur)))))
          (stop [this]
+           (log/info "Stopping replicator")
            (stopper)
            (async/put! control-chan :stop))))))
