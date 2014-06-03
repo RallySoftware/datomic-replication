@@ -172,8 +172,10 @@
   "
   ([source-conn dest-conn]
      (replicator source-conn dest-conn nil))
-  ([source-conn dest-conn {:keys [init e->lookup-ref] :as opts}]
+  ([source-conn dest-conn opts]
      (let [opts          (merge (default-opts) opts)
+           init          (:init opts)
+           e->lookup-ref (:e->lookup-ref opts)
            source-conn   (if (string? source-conn)
                            (d/connect source-conn)
                            source-conn)
