@@ -9,19 +9,17 @@
 
 (defn- init-dest-database
   "This is the default implementation of the `:init` function that you
-  can pass to `replicator`. 
+  can pass to `replicator`.
 
   It creates the attribute in the
   destination database that connects each entity to its corresponding
   entity in the source database. It also gets a transaction from the
   source database as a parameter, so that it can use the
-  txInstant. This is necessary because we need to set the timestamp of
-  this initialization-transaction to be earlier than the first
-  transaction that we will replicate from teh source."
+  txInstant."
   [conn tx]
   @(d/transact conn
                [{:db/id                 (d/tempid :db.part/tx)
-                 :db/txInstant          (Date. (- (.getTime (:db/txInstant tx)) 1000))} ; One second before tx
+                 :db/txInstant          (:db/txInstant tx)}
                 {:db/id                 (d/tempid :db.part/db)
                  :db/ident              :datomic-replication/source-eid
                  :db/valueType          :db.type/long
@@ -42,20 +40,20 @@
 (defn transactions
   "Returns an async channel of transactions.
    Options include:
-    - from-t - the `t` to start at
+    - start-t - the `t` to start at
     - poll-interval - how long to pause when there are no new transactions
   "
   ([conn]
-     (transactions conn {:from-t        nil
+     (transactions conn {:start-t       nil
                          :poll-interval 100}))
   ([conn opts]
-     (let [{:keys [from-t poll-interval]} opts
+     (let [{:keys [start-t poll-interval]} opts
            ch        (async/chan)
            continue? (atom true)
            stopper   #(reset! continue? false)]
-       (go-loop [from-t from-t]
+       (go-loop [start-t start-t]
          (when @continue?
-           (let [txs (d/tx-range (d/log conn) from-t nil)]
+           (let [txs (d/tx-range (d/log conn) start-t nil)]
              (if (seq txs)
                (do
                  (doseq [tx txs]
@@ -64,7 +62,7 @@
                  (recur (inc (:t (last txs)))))
                (do
                  (<! (async/timeout poll-interval))
-                 (recur from-t))))))
+                 (recur start-t))))))
        [ch stopper])))
 
 
@@ -159,7 +157,7 @@
    - :poll-interval - Number of milliseconds to wait before calling `tx-range` again
                      after calling it and getting no transactions. This determines
                      how frequently to poll when we are \"caught up\".
-   - :from-t - The `t` to start from. Default is nil, which means to start at the 
+   - :start-t - The `t` to start from. Default is nil, which means to start at the
                beginning of the source database's history, or at the last-t stored
                in the destination database.
   "
