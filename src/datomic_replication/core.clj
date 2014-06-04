@@ -7,25 +7,64 @@
   (:import [java.util Date]))
 
 
+;;; Helpers
+
+(defn- attr-def [ident type & [opts]]
+  (let [type (keyword "db.type" (name type))]
+    (merge {:db/id                 (d/tempid :db.part/db)
+            :db/ident              ident
+            :db/valueType          type
+            :db/cardinality        :db.cardinality/one
+            :db.install/_attribute :db.part/db}
+           opts)))
+
+(defn- transact-at [conn tx-instant datoms]
+  (d/transact conn
+              (conj datoms
+                    {:db/id        (d/tempid :db.part/tx)
+                     :db/txInstant tx-instant})))
+
+(defn- partition-ident [db eid]
+  (:db/ident (d/entity db (d/part eid))))
+
+
+;;; 
+
 (defn- init-dest-database
   "This is the default implementation of the `:init` function that you
   can pass to `replicator`.
 
-  It creates the attribute in the
-  destination database that connects each entity to its corresponding
-  entity in the source database. It also gets a transaction from the
-  source database as a parameter, so that it can use the
-  txInstant."
-  [conn tx]
-  @(d/transact conn
-               [{:db/id                 (d/tempid :db.part/tx)
-                 :db/txInstant          (:db/txInstant tx)}
-                {:db/id                 (d/tempid :db.part/db)
-                 :db/ident              :datomic-replication/source-eid
-                 :db/valueType          :db.type/long
-                 :db/unique             :db.unique/identity
-                 :db/cardinality        :db.cardinality/one
-                 :db.install/_attribute :db.part/db}]))
+  It does the following:
+
+  - Creates the attribute :datomic-replication/source-eid in the
+  destination database, which connects each entity to its corresponding
+  entity in the source database.
+
+  - Creates an entity to store replication metadata. This entity has
+  the ident :datomic-replication/metadata-store, is in a partition
+  called :datomic-replication, and has attributes:
+    - :datomic-replication/source-t, long, the t-value in the source
+      database of the last-replicated transaction
+
+  This function receives the txInstant of the first transaction that
+  will be replicated from the source database as a parameter, so that
+  it can use it as the instant of this transaction."
+  [conn tx-instant]
+  ;; Note: this is idempotent (I think)
+  @(transact-at conn
+                tx-instant
+                [(attr-def :datomic-replication/source-eid
+                           :long
+                           {:db/unique :db.unique/identity})
+                 (attr-def :datomic-replication/source-t
+                           :long)
+                 {:db/id                 (d/tempid :db.part/db)
+                  :db/ident              :datomic-replication
+                  :db.install/_partition :db.part/db}])
+  @(transact-at conn
+                tx-instant
+                [{:db/id    (d/tempid :datomic-replication)
+                  :db/ident :datomic-replication/metadata}]))
 
 (def ^:dynamic e->lookup-ref-default
   "Function that returns the :ident of an attribute to use as the
@@ -66,12 +105,6 @@
        [ch stopper])))
 
 
-(defn partition-ident [db eid]
-  (:db/ident (d/entity db (d/part eid))))
-
-(defn skip-attr? [attr]
-  false)
-
 (defn replicate-tx
   "Sends the transaction to the connection."
   [{:keys [t data] :as tx} source-conn dest-conn e->lookup-ref]
@@ -110,8 +143,7 @@
                                  is-ref?          (= :db.type/ref (:db/valueType attr))
                                  v                (if is-ref?
                                                     (->dest-eid v)
-                                                    v)]
-                           :when (not (skip-attr? attr))]
+                                                    v)]]
                        (if added?
                          (hash-map
                           :db/id     (->dest-eid e)
@@ -120,10 +152,15 @@
                          [:db/retract
                           [id-attr id-val]
                           attr-ident
-                          v]))]
+                          v]))
+
+        metadata     [:db/add
+                      :datomic-replication/metadata
+                      :datomic-replication/source-t
+                      t]]
     ;;(log/info "transacting:" datoms)
     (try
-      @(d/transact dest-conn datoms)
+      @(d/transact dest-conn (conj datoms metadata))
       (catch Exception e
         (log/error e "Exception thrown by replicate-tx")
         (throw e)))))
@@ -139,27 +176,35 @@
    :poll-interval 100
    :start-t       nil})
 
+(defn- get-start-t [conn]
+  (let [db   (d/db conn)
+        meta (d/entity db :datomic-replication/metadata)]
+    (:datomic-replication/source-t meta)))
+
 (defn replicator
   "Returns a replicator that copies transactions from source-conn to dest-conn.
   These can be actual connections or just the URIs as strings.
 
   Call `start`, passing the returned object, to begin replication.
   Call `stop` to stop replication.
+
   `opts` is a map that can have the the following keys (all optional):
-   - :init - function to initialize the destination database. Will be passed 2
-            arguments: [dest-conn tx], where `tx` is the first transaction to be
-            replicated. The default is `init-dest-database`, which creates the
-            :datomic-replication/source-eid attribute with a :txInstant one second
-            earlier than `tx`.
-   - :e->lookup-ref - Function to return a lookup-ref, given a db and an eid. The
-                      default returns [:db/ident <ident>] if the entity has an ident,
-                      or [:datomic-replication/source-eid <eid>] otherwise.
-   - :poll-interval - Number of milliseconds to wait before calling `tx-range` again
-                     after calling it and getting no transactions. This determines
-                     how frequently to poll when we are \"caught up\".
-   - :start-t - The `t` to start from. Default is nil, which means to start at the
-               beginning of the source database's history, or at the last-t stored
-               in the destination database.
+
+  :init - function to initialize the destination database. Will be
+  passed 2 arguments: [dest-conn tx-instant], where `tx-instant` is
+  that of the first transaction to be replicated.
+
+  :e->lookup-ref - Function to return a lookup-ref, given a db and an
+  eid. The default returns [:db/ident <ident>] if the entity has an
+  ident, or [:datomic-replication/source-eid <eid>] otherwise.
+  
+  :poll-interval - Number of milliseconds to wait before calling
+  `tx-range` again after calling it and getting no transactions. This
+  determines how frequently to poll when we are \"caught up\".
+  
+  :start-t - The `t` to start from. Default is nil, which means to
+  start at the beginning of the source database's history, or at the
+  last-replicated t, as stored in the destination database.
   "
   ([source-conn dest-conn]
      (replicator source-conn dest-conn nil))
@@ -175,8 +220,10 @@
                              (d/create-database dest-conn)
                              (d/connect dest-conn))
                            dest-conn)
+           start-t       (or (:start-t opts)
+                             (get-start-t dest-conn))
            control-chan  (async/chan)
-           [txs stopper] (transactions source-conn opts)
+           [txs stopper] (transactions source-conn (assoc opts :start-t start-t))
            initialized?  (atom false)]
        (reify Replicator
          (start [this]
@@ -186,9 +233,16 @@
                (when (identical? ch txs)
                  (when-not @initialized?
                    (log/info "Initializing destination database")
-                   (reset! initialized? true)
-                   (init dest-conn (-> tx :data first (nth 3) (->> (d/entity (d/db source-conn))))))
-                 (replicate-tx tx source-conn dest-conn e->lookup-ref)
+                   (let [tx-instant (->> tx :t d/t->tx (d/entity (d/db source-conn)) :db/txInstant)]
+                     (init dest-conn tx-instant))
+                   (reset! initialized? true))
+                 (try
+                   (replicate-tx tx source-conn dest-conn e->lookup-ref)
+                   (catch clojure.lang.ExceptionInfo e
+                     (when (= :db.error/transaction-timeout (:db/error (ex-data e)))
+                       ;; Transact timeout. Wait a bit and try again.
+                       (log/warn "Transact timed out. Pausing.")
+                       (<! (async/timeout 10000)))))
                  (recur)))))
          (stop [this]
            (log/info "Stopping replicator")

@@ -41,7 +41,7 @@
       ;; Create an attribute in the source database
       (define-attr c1 :user/name :string)
 
-      ;; Wait a bit for it to replicate
+      ;; Wait a bit for it to replicatenre
       (Thread/sleep 500)
 
       ;; And make sure that the attribute got replicated
@@ -81,7 +81,7 @@
         (rep/stop replicator)))))
 
 
-(deftest test-replication-3
+(deftest test-replication-with-partitions
   ;; Partitions
   (with-databases
     ;; Start the replication
