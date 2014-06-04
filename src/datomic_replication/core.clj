@@ -2,8 +2,8 @@
   "Datomic Replication"
   (:require [clojure.core.async :as async :refer [go go-loop <! >!]]
             [clojure.tools.logging :as log]
-            [datomic.api :as d]
-            [enos.core :refer [dochan!]])
+            [datomic.api :as d])
+  (:refer-clojure :exclude [replicate])
   (:import [java.util Date]))
 
 
@@ -27,12 +27,25 @@
 (defn- partition-ident [db eid]
   (:db/ident (d/entity db (d/part eid))))
 
+(defn- tx->instant [conn tx]
+ (->> tx :t d/t->tx (d/entity (d/db conn)) :db/txInstant))
 
-;;; 
+(defn- ->conn [conn & [create?]]
+  (if (string? conn)
+    (do
+      (log/info "Connecting to" conn)
+      (when create?
+        (d/create-database conn))
+      (let [c (d/connect conn)]
+        (log/info "Connected!")
+        c))
+    conn))
+
+;;;
 
 (defn- init-dest-database
   "This is the default implementation of the `:init` function that you
-  can pass to `replicator`.
+  can pass to `replicate`.
 
   It does the following:
 
@@ -87,23 +100,22 @@
                          :poll-interval 100}))
   ([conn opts]
      (let [{:keys [start-t poll-interval]} opts
-           ch        (async/chan)
-           continue? (atom true)
-           stopper   #(reset! continue? false)]
+           ch (async/chan)]
        (go-loop [start-t start-t]
-         (when @continue?
-           (let [txs (d/tx-range (d/log conn) start-t nil)]
-             (if (seq txs)
-               (do
-                 (doseq [tx txs]
-                   (when @continue?
-                     (>! ch tx)))
-                 (recur (inc (:t (last txs)))))
-               (do
-                 (<! (async/timeout poll-interval))
-                 (recur start-t))))))
-       [ch stopper])))
+         (let [txs (seq (d/tx-range (d/log conn) start-t nil))]
+           (if txs
+             (do
+               (loop [[tx & txs] txs]
+                 (when (and tx (>! ch tx))
+                   (recur txs)))
+               (recur (inc (:t (last txs)))))
+             (do
+               (<! (async/timeout poll-interval))
+               (recur start-t)))))
+       ch)))
 
+(defn skip-attr? [ident]
+  (#{:db/txInstant} ident))
 
 (defn replicate-tx
   "Sends the transaction to the connection."
@@ -143,7 +155,8 @@
                                  is-ref?          (= :db.type/ref (:db/valueType attr))
                                  v                (if is-ref?
                                                     (->dest-eid v)
-                                                    v)]]
+                                                    v)]
+                           :when (not (skip-attr? attr-ident))]
                        (if added?
                          (hash-map
                           :db/id     (->dest-eid e)
@@ -160,15 +173,11 @@
                       t]]
     ;;(log/info "transacting:" datoms)
     (try
-      @(d/transact dest-conn (conj datoms metadata))
+      @(transact-at dest-conn (tx->instant source-conn tx) (conj datoms metadata))
       (catch Exception e
         (log/error e "Exception thrown by replicate-tx")
         (throw e)))))
 
-
-(defprotocol Replicator
-  (start [this])
-  (stop  [this]))
 
 (defn default-opts []
   {:init          init-dest-database
@@ -181,12 +190,9 @@
         meta (d/entity db :datomic-replication/metadata)]
     (:datomic-replication/source-t meta)))
 
-(defn replicator
-  "Returns a replicator that copies transactions from source-conn to dest-conn.
-  These can be actual connections or just the URIs as strings.
-
-  Call `start`, passing the returned object, to begin replication.
-  Call `stop` to stop replication.
+(defn replicate
+  "Replicates transactions from source-conn to dest-conn, which
+  can be actual connections or their URIs as strings.
 
   `opts` is a map that can have the the following keys (all optional):
 
@@ -197,54 +203,55 @@
   :e->lookup-ref - Function to return a lookup-ref, given a db and an
   eid. The default returns [:db/ident <ident>] if the entity has an
   ident, or [:datomic-replication/source-eid <eid>] otherwise.
-  
+
   :poll-interval - Number of milliseconds to wait before calling
   `tx-range` again after calling it and getting no transactions. This
   determines how frequently to poll when we are \"caught up\".
-  
+
   :start-t - The `t` to start from. Default is nil, which means to
   start at the beginning of the source database's history, or at the
   last-replicated t, as stored in the destination database.
   "
   ([source-conn dest-conn]
-     (replicator source-conn dest-conn nil))
+     (replicate source-conn dest-conn nil))
   ([source-conn dest-conn opts]
      (let [opts          (merge (default-opts) opts)
            init          (:init opts)
            e->lookup-ref (:e->lookup-ref opts)
-           source-conn   (if (string? source-conn)
-                           (d/connect source-conn)
-                           source-conn)
-           dest-conn     (if (string? dest-conn)
-                           (do
-                             (d/create-database dest-conn)
-                             (d/connect dest-conn))
-                           dest-conn)
+           dest-conn     (->conn dest-conn true)
+           source-conn   (->conn source-conn)
            start-t       (or (:start-t opts)
                              (get-start-t dest-conn))
            control-chan  (async/chan)
-           [txs stopper] (transactions source-conn (assoc opts :start-t start-t))
+           txs           (transactions source-conn (assoc opts :start-t start-t))
            initialized?  (atom false)]
-       (reify Replicator
-         (start [this]
-           (log/info "Starting replicator")
-           (go-loop []
-             (let [[tx ch] (async/alts! [txs control-chan])]
-               (when (identical? ch txs)
-                 (when-not @initialized?
-                   (log/info "Initializing destination database")
-                   (let [tx-instant (->> tx :t d/t->tx (d/entity (d/db source-conn)) :db/txInstant)]
-                     (init dest-conn tx-instant))
-                   (reset! initialized? true))
-                 (try
-                   (replicate-tx tx source-conn dest-conn e->lookup-ref)
-                   (catch clojure.lang.ExceptionInfo e
-                     (when (= :db.error/transaction-timeout (:db/error (ex-data e)))
-                       ;; Transact timeout. Wait a bit and try again.
-                       (log/warn "Transact timed out. Pausing.")
-                       (<! (async/timeout 10000)))))
-                 (recur)))))
-         (stop [this]
-           (log/info "Stopping replicator")
-           (stopper)
-           (async/put! control-chan :stop))))))
+
+       (log/info "Starting replication at " start-t)
+       (go-loop []
+         (let [[tx ch] (async/alts! [txs control-chan])]
+           (when (identical? ch txs)
+             (try
+               
+               (when-not @initialized?
+                 (log/info "Initializing destination database")
+                 (init dest-conn (tx->instant source-conn tx))
+                 (reset! initialized? true))
+               
+               (replicate-tx tx source-conn dest-conn e->lookup-ref)
+               
+               (catch clojure.lang.ExceptionInfo e
+                 (if (= :db.error/transaction-timeout (:db/error (ex-data e)))
+                   (do
+                     ;; Transact timeout. Wait a bit and try again.
+                     (log/warn "Transact timed out. Pausing.")
+                     (<! (async/timeout 10000)))
+                   (throw e)))
+               (catch Exception e
+                 (log/error e "Exception in main loop - exiting.")))
+             (recur))))
+
+       ;; Return a no-arg function that can be called to stop the replication.
+       (fn []
+         (log/info "Stopping replication")
+         (async/put! control-chan :stop)
+         (async/close! txs)))))
