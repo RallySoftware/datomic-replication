@@ -3,8 +3,7 @@
   (:require [clojure.core.async :as async :refer [go go-loop <! >!]]
             [clojure.tools.logging :as log]
             [datomic.api :as d])
-  (:refer-clojure :exclude [replicate])
-  (:import [java.util Date]))
+  (:refer-clojure :exclude [replicate]))
 
 
 ;;; Helpers
@@ -96,10 +95,10 @@
     - poll-interval - how long to pause when there are no new transactions
   "
   ([conn]
-     (transactions conn {:start-t       nil
-                         :poll-interval 100}))
+     (transactions conn nil))
   ([conn opts]
      (let [{:keys [start-t poll-interval]} opts
+           poll-interval (or poll-interval 100)
            ch (async/chan)]
        (go-loop [start-t start-t]
          (let [txs (seq (d/tx-range (d/log conn) start-t nil))]
@@ -114,6 +113,27 @@
                (recur start-t)))))
        ch)))
 
+;;; Alternative, lazy-seq version
+(defn tx-seq
+  "Returns an infinite lazy-seq of transactions.
+   Options include:
+    - start-t - the `t` to start at
+    - poll-interval - how long to pause when there are no new transactions
+  "
+  ([conn]
+     (transactions conn nil))
+  ([conn {:keys [start-t poll-interval] :as opts}]
+     (lazy-seq
+      (let [poll-interval (or poll-interval 100)
+            txs           (seq (d/tx-range (d/log conn) start-t nil))]
+        (if txs
+          (concat txs (tx-seq conn (assoc opts :start-t (inc (:t (last txs))))))
+          (do
+            ;; No transactions - wait and try again
+            (Thread/sleep poll-interval)
+            (tx-seq conn opts)))))))
+
+
 (defn skip-attr? [ident]
   (#{:db/txInstant} ident))
 
@@ -123,7 +143,6 @@
   (log/info "Got tx: " {:t (:t tx) :count (count (:data tx))})
   (let [source-db    (d/as-of (d/db source-conn) t)
         dest-db      (d/db dest-conn)
-        eids         (distinct (for [[e] data] e))
 
         ;; Mapping from each distinct eid to a database-independent
         ;; identifier for the entity - a lookup-ref in the form:
@@ -239,15 +258,14 @@
                
                (replicate-tx tx source-conn dest-conn e->lookup-ref)
                
-               (catch clojure.lang.ExceptionInfo e
+               (catch Exception e
                  (if (= :db.error/transaction-timeout (:db/error (ex-data e)))
                    (do
                      ;; Transact timeout. Wait a bit and try again.
                      (log/warn "Transact timed out. Pausing.")
-                     (<! (async/timeout 10000)))
-                   (throw e)))
-               (catch Exception e
-                 (log/error e "Exception in main loop - exiting.")))
+                     (<! (async/timeout 1000)))
+                   ;; Any other exception - rethrow.
+                   (throw e))))
              (recur))))
 
        ;; Return a no-arg function that can be called to stop the replication.

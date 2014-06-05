@@ -4,7 +4,8 @@ Replicate a datomic database to another datomic database.
 
 ## Why?
 
-We developed this to support fast failover from a hot to a warm datacenter.
+We developed this at Rally Software to support fast failover from a
+hot to a warm datacenter.
 
 
 ## How Does it Work?
@@ -189,6 +190,10 @@ lookup-refs for retractions.
              (:db/ident (d/entity source-db a))
              v])))))
 ```
+
+
+TODO: Finish / fix this document. I wrote the above before writing the
+code, and it ended up working a little bit differently.
 
 ## License
 

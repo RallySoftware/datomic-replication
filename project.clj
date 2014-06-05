@@ -1,4 +1,4 @@
-(defproject com.rallydev/datomic-replication "0.1.0"
+(defproject com.rallydev/datomic-replication "0.1.1-SNAPSHOT"
   
   :description "Datomic Replication"
   :url "http://github.com/RallySoftware/datomic-replication"
