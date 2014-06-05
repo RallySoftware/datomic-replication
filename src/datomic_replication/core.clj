@@ -1,7 +1,6 @@
 (ns datomic-replication.core
   "Datomic Replication"
-  (:require [clojure.core.async :as async :refer [go go-loop <! >!]]
-            [clojure.tools.logging :as log]
+  (:require [clojure.tools.logging :as log]
             [datomic.api :as d])
   (:refer-clojure :exclude [replicate]))
 
@@ -88,32 +87,6 @@
         [:datomic-replication/source-eid (:db/id ent)]))))
 
 
-(defn transactions
-  "Returns an async channel of transactions.
-   Options include:
-    - start-t - the `t` to start at
-    - poll-interval - how long to pause when there are no new transactions
-  "
-  ([conn]
-     (transactions conn nil))
-  ([conn opts]
-     (let [{:keys [start-t poll-interval]} opts
-           poll-interval (or poll-interval 100)
-           ch (async/chan)]
-       (go-loop [start-t start-t]
-         (let [txs (seq (d/tx-range (d/log conn) start-t nil))]
-           (if txs
-             (do
-               (loop [[tx & txs] txs]
-                 (when (and tx (>! ch tx))
-                   (recur txs)))
-               (recur (inc (:t (last txs)))))
-             (do
-               (<! (async/timeout poll-interval))
-               (recur start-t)))))
-       ch)))
-
-;;; Alternative, lazy-seq version
 (defn tx-seq
   "Returns an infinite lazy-seq of transactions.
    Options include:
@@ -121,7 +94,7 @@
     - poll-interval - how long to pause when there are no new transactions
   "
   ([conn]
-     (transactions conn nil))
+     (tx-seq conn nil))
   ([conn {:keys [start-t poll-interval] :as opts}]
      (lazy-seq
       (let [poll-interval (or poll-interval 100)
@@ -129,9 +102,10 @@
         (if txs
           (concat txs (tx-seq conn (assoc opts :start-t (inc (:t (last txs))))))
           (do
-            ;; No transactions - wait and try again
+            ;; No transactons - wait and try again. Yield a nil from
+            ;; the channel to avoid blocking the forever.
             (Thread/sleep poll-interval)
-            (tx-seq conn opts)))))))
+            (cons nil (tx-seq conn opts))))))))
 
 
 (defn skip-attr? [ident]
@@ -241,35 +215,39 @@
            source-conn   (->conn source-conn)
            start-t       (or (:start-t opts)
                              (get-start-t dest-conn))
-           control-chan  (async/chan)
-           txs           (transactions source-conn (assoc opts :start-t start-t))
-           initialized?  (atom false)]
+           initialized?  (atom false)
+           stop?         (atom false)
 
-       (log/info "Starting replication at " start-t)
-       (go-loop []
-         (let [[tx ch] (async/alts! [txs control-chan])]
-           (when (identical? ch txs)
-             (try
-               
-               (when-not @initialized?
-                 (log/info "Initializing destination database")
-                 (init dest-conn (tx->instant source-conn tx))
-                 (reset! initialized? true))
-               
-               (replicate-tx tx source-conn dest-conn e->lookup-ref)
-               
-               (catch Exception e
-                 (if (= :db.error/transaction-timeout (:db/error (ex-data e)))
-                   (do
-                     ;; Transact timeout. Wait a bit and try again.
-                     (log/warn "Transact timed out. Pausing.")
-                     (<! (async/timeout 1000)))
-                   ;; Any other exception - rethrow.
-                   (throw e))))
-             (recur))))
-
+           replicator
+           (future
+             (log/info "Starting replication at " start-t)
+             (loop [[tx & txs :as all-txs] (tx-seq source-conn (assoc opts :start-t start-t))]
+               (when-not @stop?
+                 (recur
+                  (if tx
+                    (try
+                      (when-not @initialized?
+                        (log/info "Initializing destination database")
+                        (init dest-conn (tx->instant source-conn tx))
+                        (reset! initialized? true))
+                            
+                      (replicate-tx tx source-conn dest-conn e->lookup-ref)
+                      txs
+                            
+                      (catch Exception e
+                        (if (= :db.error/transaction-timeout (:db/error (ex-data e)))
+                          (do
+                            ;; Transact timeout. Wait a bit and try again.
+                            (log/warn "Transact timed out. Pausing.")
+                            (Thread/sleep 5000)
+                            all-txs)
+                          ;; Any other exception - rethrow.
+                          (throw e))))
+                    txs))))
+             nil)]
+       
        ;; Return a no-arg function that can be called to stop the replication.
        (fn []
          (log/info "Stopping replication")
-         (async/put! control-chan :stop)
-         (async/close! txs)))))
+         (reset! stop? true)
+         @replicator))))

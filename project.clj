@@ -6,8 +6,9 @@
   :license "MIT License"
   
   :dependencies [[org.clojure/clojure "1.6.0"]
-                 [org.clojure/core.async "0.1.303.0-886421-alpha"]
                  [org.clojure/tools.logging "0.1.2"]]
 
+  :jvm-opts ["-Djava.awt.headless=true"]
+  
   :profiles
   {:dev {:dependencies [[com.datomic/datomic-free "0.9.4766"]]}})
