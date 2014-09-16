@@ -93,19 +93,20 @@
     - start-t - the `t` to start at
     - poll-interval - how long to pause when there are no new transactions
   "
-  ([conn]
-     (tx-seq conn nil))
-  ([conn {:keys [start-t poll-interval] :as opts}]
-     (lazy-seq
-      (let [poll-interval (or poll-interval 100)
-            txs           (seq (d/tx-range (d/log conn) start-t nil))]
-        (if txs
-          (concat txs (tx-seq conn (assoc opts :start-t (inc (:t (last txs))))))
-          (do
-            ;; No transactons - wait and try again. Yield a nil from
-            ;; the channel to avoid blocking the forever.
-            (Thread/sleep poll-interval)
-            (cons nil (tx-seq conn opts))))))))
+  ([conn] (tx-seq conn nil))
+  ([conn {:keys [start-t poll-interval] :or {poll-interval 100} :as opts}]
+    (letfn [(step [txes t]
+              (if-let [[tx & more] txes]
+                (cons tx (lazy-seq
+                          (step more (inc (:t tx)))))
+                (if-let [more (seq (d/tx-range (d/log conn) t nil))]
+                  (step more t)
+                  (do
+                    (Thread/sleep poll-interval)
+                    ;; yield a nil to avoid blocking forever:
+                    (cons nil (lazy-seq (step nil t)))))))]
+      (lazy-seq
+       (step nil start-t)))))
 
 
 (defn skip-attr? [ident]
